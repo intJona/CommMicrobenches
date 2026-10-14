@@ -139,6 +139,7 @@ int main(int argc, char *argv[]) {
   char *dev_send = nullptr;
   char *dev_recv = nullptr;
   char *remote_recv = nullptr; // sender's imported view of the receiver's dev_recv
+  char *remote_send = nullptr; // recver's imported view of the sender's dev_send (for the pull leg)
   char *host_stage = sycl::malloc_host<char>(MAX_BYTES, CommBench::q);
 
   auto zeContext = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(CommBench::q.get_context());
@@ -164,6 +165,25 @@ int main(int argc, char *argv[]) {
       printf("rank %d: zeMemOpenIpcHandle failed: 0x%x\n", myid, res);
     else
       printf("rank %d: P2P IPC mapping established OK (remote_recv=%p)\n", myid, (void *)remote_recv);
+  }
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  // Reciprocal mapping: sender exports dev_send so the receiver can issue a PULL copy
+  // (read remote over PCIe, write local) instead of the sender PUSHing (read local, write remote).
+  if (myid == sender) {
+    ze_ipc_mem_handle_t handle;
+    ze_result_t res = zeMemGetIpcHandle(zeContext, dev_send, &handle);
+    if (res != ZE_RESULT_SUCCESS)
+      printf("rank %d: zeMemGetIpcHandle (dev_send) failed: 0x%x\n", myid, res);
+    serve_ipc_handle(handle);
+  }
+  if (myid == recver) {
+    ze_ipc_mem_handle_t handle = fetch_ipc_handle();
+    ze_result_t res = zeMemOpenIpcHandle(zeContext, zeDevice, handle, 0, (void **)&remote_send);
+    if (res != ZE_RESULT_SUCCESS)
+      printf("rank %d: zeMemOpenIpcHandle (remote_send) failed: 0x%x\n", myid, res);
+    else
+      printf("rank %d: P2P PULL IPC mapping established OK (remote_send=%p)\n", myid, (void *)remote_send);
   }
   MPI_Barrier(MPI_COMM_WORLD);
 
@@ -215,6 +235,59 @@ int main(int argc, char *argv[]) {
           for (double t : times) avgT += t;
           avgT /= times.size();
           printf("---- size %10zu bytes : P2P (IPC, Level-Zero) ----\n", bytes);
+          printf("minTime: %.4e us, %.4e GB/s\n", minT * 1e6, bytes / minT / 1e9);
+          printf("medTime: %.4e us, %.4e GB/s\n", medT * 1e6, bytes / medT / 1e9);
+          printf("avgTime: %.4e us, %.4e GB/s\n\n", avgT * 1e6, bytes / avgT / 1e9);
+        }
+      }
+    }
+
+    // ---------------- Leg 1b: P2P PULL direction (receiver issues the read, not the sender) ----
+    // NOTE: on this driver, reading a peer's memory through a zeMemOpenIpcHandle-imported
+    // pointer silently returns stale/zero data (Level-Zero reports SUCCESS at every step,
+    // confirmed by also bypassing SYCL and issuing the copy via raw zeCommandListAppendMemoryCopy
+    // directly) -- only the PUSH direction (sender writes to the imported remote pointer) works.
+    // The correctness check below is expected to fail every time; it's kept so the leg is
+    // automatically re-tested (and would start reporting real numbers) if a future driver fixes this.
+    {
+      bool ok = true;
+      if (myid == sender)
+        CommBench::q.memcpy(dev_send, host_pattern.data(), bytes).wait();
+      MPI_Barrier(MPI_COMM_WORLD);
+
+      if (myid == recver)
+        CommBench::q.memcpy(dev_recv, remote_send, bytes).wait();
+      MPI_Barrier(MPI_COMM_WORLD);
+
+      if (myid == recver) {
+        CommBench::q.memcpy(host_result.data(), dev_recv, bytes).wait();
+        ok = (memcmp(host_result.data(), host_pattern.data(), bytes) == 0);
+      }
+      MPI_Bcast(&ok, 1, MPI_C_BOOL, recver, MPI_COMM_WORLD);
+
+      if (!ok) {
+        if (myid == printid && bytes == MIN_BYTES)
+          printf("size %10zu bytes (and all larger): P2P PULL (IPC) leg FAILED CORRECTNESS CHECK -- "
+                 "reading a peer's memory via IPC import doesn't work on this driver, skipping timing for all sizes\n\n", bytes);
+      } else {
+        std::vector<double> times(ITERS);
+        for (int iter = -WARMUP; iter < ITERS; iter++) {
+          MPI_Barrier(MPI_COMM_WORLD);
+          double t0 = MPI_Wtime();
+          if (myid == recver)
+            CommBench::q.memcpy(dev_recv, remote_send, bytes).wait();
+          double elapsed = MPI_Wtime() - t0;
+          MPI_Bcast(&elapsed, 1, MPI_DOUBLE, recver, MPI_COMM_WORLD);
+          if (iter >= 0)
+            times[iter] = elapsed;
+        }
+        if (myid == printid) {
+          double minT = *std::min_element(times.begin(), times.end());
+          double medT = median_of(times);
+          double avgT = 0;
+          for (double t : times) avgT += t;
+          avgT /= times.size();
+          printf("---- size %10zu bytes : P2P PULL (IPC, Level-Zero) ----\n", bytes);
           printf("minTime: %.4e us, %.4e GB/s\n", minT * 1e6, bytes / minT / 1e9);
           printf("medTime: %.4e us, %.4e GB/s\n", medT * 1e6, bytes / medT / 1e9);
           printf("avgTime: %.4e us, %.4e GB/s\n\n", avgT * 1e6, bytes / avgT / 1e9);

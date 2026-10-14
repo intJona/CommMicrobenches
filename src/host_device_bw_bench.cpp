@@ -36,12 +36,21 @@ static void sweep(sycl::queue &q, bool to_device) {
   const char *label = to_device ? "H->D" : "D->H";
   char *dev_buf = sycl::malloc_device<char>(MAX_BYTES, q);
   char *host_buf = sycl::malloc_host<char>(MAX_BYTES, q);
-  std::memset(host_buf, 0x5A, MAX_BYTES);
+  char *host_check = sycl::malloc_host<char>(MAX_BYTES, q);
+  for (size_t i = 0; i < MAX_BYTES; i++) host_buf[i] = (char)((i * 2654435761ULL) & 0xFF);
 
   for (size_t bytes = MIN_BYTES; bytes <= MAX_BYTES; bytes *= 2) {
     for (int w = 0; w < WARMUP; w++) {
       if (to_device) q.memcpy(dev_buf, host_buf, bytes).wait();
       else q.memcpy(host_buf, dev_buf, bytes).wait();
+    }
+
+    // Correctness check before trusting any timing: round-trip through dev_buf and compare.
+    q.memcpy(dev_buf, host_buf, bytes).wait();
+    q.memcpy(host_check, dev_buf, bytes).wait();
+    if (memcmp(host_check, host_buf, bytes) != 0) {
+      printf("%-4s %12zu bytes : CORRECTNESS CHECK FAILED -- skipping timing\n", label, bytes);
+      continue;
     }
 
     std::vector<double> host_times, device_times;
@@ -71,6 +80,7 @@ static void sweep(sycl::queue &q, bool to_device) {
 
   sycl::free(dev_buf, q);
   sycl::free(host_buf, q);
+  sycl::free(host_check, q);
 }
 
 int main(int argc, char *argv[]) {
