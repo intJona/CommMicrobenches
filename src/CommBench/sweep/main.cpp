@@ -43,6 +43,12 @@ static const int WARMUP = 5;
 static const int ITERS = 20;
 static const char *SOCK_PATH = "/tmp/p2psweep_ipc.sock";
 
+// Chunking for the pipelined no-P2P baseline (Leg 3): fixed-size slices staged through a small
+// ring of host buffers so the device<->host copy, MPI hop, and host<->device copy of neighboring
+// chunks overlap instead of fully serializing like Leg 2's single-shot staged transfer.
+static const size_t PIPE_CHUNK = 1ULL * 1024 * 1024;      // 1 MB chunks
+static const int PIPE_NBUF = 4;                           // ring depth (in-flight chunks)
+
 static void fill_pattern(std::vector<char> &buf) {
   for (size_t i = 0; i < buf.size(); i++)
     buf[i] = (char)((i * 2654435761ULL) & 0xFF);
@@ -184,6 +190,21 @@ int main(int argc, char *argv[]) {
     zeCommandListCreateImmediate(zeContext, zeDevice, &cq_desc, &copy_cl);
   }
 
+  // Ring of host staging buffers + per-slot completion events for the pipelined no-P2P leg below.
+  std::vector<char *> pipe_buf(PIPE_NBUF);
+  for (int i = 0; i < PIPE_NBUF; i++)
+    pipe_buf[i] = sycl::malloc_host<char>(PIPE_CHUNK, CommBench::q);
+  ze_event_pool_handle_t pipe_pool = nullptr;
+  std::vector<ze_event_handle_t> pipe_evt(PIPE_NBUF);
+  {
+    ze_event_pool_desc_t pool_desc = {ZE_STRUCTURE_TYPE_EVENT_POOL_DESC, nullptr,
+                                       ZE_EVENT_POOL_FLAG_HOST_VISIBLE, (uint32_t)PIPE_NBUF};
+    zeEventPoolCreate(zeContext, &pool_desc, 1, &zeDevice, &pipe_pool);
+    for (int i = 0; i < PIPE_NBUF; i++) {
+      ze_event_desc_t evt_desc = {ZE_STRUCTURE_TYPE_EVENT_DESC, nullptr, (uint32_t)i, 0, ZE_EVENT_SCOPE_FLAG_HOST};
+      zeEventCreate(pipe_pool, &evt_desc, &pipe_evt[i]);
+    }
+  }
 
   if (myid == sender)
     dev_send = sycl::malloc_device<char>(MAX_BYTES, CommBench::q);
@@ -389,11 +410,12 @@ int main(int argc, char *argv[]) {
       }
     }
 
-    // ---------------- Leg 2: staged GPU0 -> host -> GPU1 ("P2P disabled" baseline), raw L0 ------
-    // Same host-staged mechanism as before, but the host<->device copies now go through raw
-    // Level-Zero on each rank's own dedicated copy engine instead of SYCL queue.memcpy() -- an
-    // apples-to-apples comparison against the 'p2p' leg above (both bypass the SYCL abstraction
-    // tax; the only remaining variable is P2P-over-PCIe vs round-tripping through host RAM).
+    // ---------------- Leg 2: staged GPU0 -> host -> GPU1, no pipeline ("P2P disabled" baseline) --
+    // Same host-staged mechanism as before, the host<->device copies go through raw Level-Zero on
+    // each rank's own dedicated copy engine instead of SYCL queue.memcpy(). The whole buffer makes
+    // one full device->host copy, then one full MPI hop, then one full host->device copy, with no
+    // overlap between stages -- kept as the naive/worst-case reference against Leg 3's pipelined
+    // version below.
     {
       bool ok = true;
       if (myid == sender)
@@ -445,7 +467,93 @@ int main(int argc, char *argv[]) {
           double avgT = 0;
           for (double t : times) avgT += t;
           avgT /= times.size();
-          printf("---- size %10zu bytes : staged (GPU->host->GPU, P2P disabled) ----\n", bytes);
+          printf("---- size %10zu bytes : staged, no pipeline (GPU->host->GPU, P2P disabled) ----\n", bytes);
+          printf("minTime: %.4e us, %.4e GB/s\n", minT * 1e6, bytes / minT / 1e9);
+          printf("medTime: %.4e us, %.4e GB/s\n", medT * 1e6, bytes / medT / 1e9);
+          printf("avgTime: %.4e us, %.4e GB/s\n\n", avgT * 1e6, bytes / avgT / 1e9);
+        }
+      }
+    }
+
+    // ---------------- Leg 3: staged GPU0 -> host -> GPU1, pipelined ("P2P disabled" baseline) ---
+    // Same staged mechanism as Leg 2, but chunked through a ring of PIPE_NBUF host buffers so the
+    // device->host copy, MPI hop, and host->device copy of neighboring chunks overlap in flight
+    // instead of fully serializing -- a fairer best-effort "P2P disabled" ceiling.
+    {
+      size_t chunks = (bytes + PIPE_CHUNK - 1) / PIPE_CHUNK;
+      auto run_pass = [&]() {
+        if (myid == sender) {
+          std::vector<MPI_Request> req(PIPE_NBUF, MPI_REQUEST_NULL);
+          for (size_t c = 0; c < chunks; c++) {
+            int slot = (int)(c % PIPE_NBUF);
+            if (req[slot] != MPI_REQUEST_NULL)
+              MPI_Wait(&req[slot], MPI_STATUS_IGNORE);
+            size_t off = c * PIPE_CHUNK;
+            size_t len = std::min(PIPE_CHUNK, bytes - off);
+            zeCommandListAppendMemoryCopy(copy_cl, pipe_buf[slot], dev_send + off, len, pipe_evt[slot], 0, nullptr);
+            zeEventHostSynchronize(pipe_evt[slot], UINT64_MAX);
+            zeEventHostReset(pipe_evt[slot]);
+            MPI_Isend(pipe_buf[slot], (int)len, MPI_BYTE, recver, (int)c, MPI_COMM_WORLD, &req[slot]);
+          }
+          for (int slot = 0; slot < PIPE_NBUF; slot++)
+            if (req[slot] != MPI_REQUEST_NULL)
+              MPI_Wait(&req[slot], MPI_STATUS_IGNORE);
+        } else {
+          std::vector<bool> copy_pending(PIPE_NBUF, false);
+          for (size_t c = 0; c < chunks; c++) {
+            int slot = (int)(c % PIPE_NBUF);
+            if (copy_pending[slot]) {
+              zeEventHostSynchronize(pipe_evt[slot], UINT64_MAX);
+              zeEventHostReset(pipe_evt[slot]);
+            }
+            size_t off = c * PIPE_CHUNK;
+            size_t len = std::min(PIPE_CHUNK, bytes - off);
+            MPI_Request rreq;
+            MPI_Irecv(pipe_buf[slot], (int)len, MPI_BYTE, sender, (int)c, MPI_COMM_WORLD, &rreq);
+            MPI_Wait(&rreq, MPI_STATUS_IGNORE);
+            zeCommandListAppendMemoryCopy(copy_cl, dev_recv + off, pipe_buf[slot], len, pipe_evt[slot], 0, nullptr);
+            copy_pending[slot] = true;
+          }
+          for (int slot = 0; slot < PIPE_NBUF; slot++)
+            if (copy_pending[slot]) {
+              zeEventHostSynchronize(pipe_evt[slot], UINT64_MAX);
+              zeEventHostReset(pipe_evt[slot]);
+            }
+        }
+      };
+
+      bool ok = true;
+      if (myid == sender)
+        CommBench::q.memcpy(dev_send, host_pattern.data(), bytes).wait();
+
+      run_pass(); // untimed correctness pass
+      if (myid == recver) {
+        CommBench::q.memcpy(host_result.data(), dev_recv, bytes).wait();
+        ok = (memcmp(host_result.data(), host_pattern.data(), bytes) == 0);
+      }
+      MPI_Bcast(&ok, 1, MPI_C_BOOL, recver, MPI_COMM_WORLD);
+
+      if (!ok) {
+        if (myid == printid)
+          printf("size %10zu bytes: staged pipelined leg FAILED CORRECTNESS CHECK -- skipping timing\n\n", bytes);
+      } else {
+        std::vector<double> times(ITERS);
+        for (int iter = -WARMUP; iter < ITERS; iter++) {
+          MPI_Barrier(MPI_COMM_WORLD);
+          double t0 = MPI_Wtime();
+          run_pass();
+          double elapsed = MPI_Wtime() - t0;
+          MPI_Bcast(&elapsed, 1, MPI_DOUBLE, sender, MPI_COMM_WORLD);
+          if (iter >= 0)
+            times[iter] = elapsed;
+        }
+        if (myid == printid) {
+          double minT = *std::min_element(times.begin(), times.end());
+          double medT = median_of(times);
+          double avgT = 0;
+          for (double t : times) avgT += t;
+          avgT /= times.size();
+          printf("---- size %10zu bytes : staged pipelined (GPU->host->GPU, P2P disabled) ----\n", bytes);
           printf("minTime: %.4e us, %.4e GB/s\n", minT * 1e6, bytes / minT / 1e9);
           printf("medTime: %.4e us, %.4e GB/s\n", medT * 1e6, bytes / medT / 1e9);
           printf("avgTime: %.4e us, %.4e GB/s\n\n", avgT * 1e6, bytes / avgT / 1e9);
@@ -457,6 +565,11 @@ int main(int argc, char *argv[]) {
   if (myid == sender && dev_send) sycl::free(dev_send, CommBench::q);
   if (myid == recver && dev_recv) sycl::free(dev_recv, CommBench::q);
   sycl::free(host_stage, CommBench::q);
+  for (int i = 0; i < PIPE_NBUF; i++) {
+    if (pipe_evt[i]) zeEventDestroy(pipe_evt[i]);
+    if (pipe_buf[i]) sycl::free(pipe_buf[i], CommBench::q);
+  }
+  if (pipe_pool) zeEventPoolDestroy(pipe_pool);
   if (copy_cl) zeCommandListDestroy(copy_cl);
 
   MPI_Finalize();

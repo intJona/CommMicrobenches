@@ -34,13 +34,14 @@ def resolve_results_root() -> Path:
 
 RESULTS_ROOT = resolve_results_root()
 RESULT_FILE_GLOB = "commbench_sweep_*.txt"
-SECTION_HEADER = re.compile(r"^---- size\s+(\d+) bytes : (P2P \(IPC, Level-Zero\)|P2P PULL \(IPC, Level-Zero\)|P2P \(raw Level-Zero, dedicated copy engine\)|staged \(GPU->host->GPU, P2P disabled\)) ----")
+SECTION_HEADER = re.compile(r"^---- size\s+(\d+) bytes : (P2P \(IPC, Level-Zero\)|P2P PULL \(IPC, Level-Zero\)|P2P \(raw Level-Zero, dedicated copy engine\)|staged, no pipeline \(GPU->host->GPU, P2P disabled\)|staged pipelined \(GPU->host->GPU, P2P disabled\)) ----")
 STAT_LINE = re.compile(r"^(minTime|medTime|avgTime):\s+([\d.eE+-]+) us,\s+([\d.eE+-]+) GB/s")
 LEG_LABEL = {
     "P2P (IPC, Level-Zero)": "p2p_sycl",
     "P2P PULL (IPC, Level-Zero)": "p2p_pull",
     "P2P (raw Level-Zero, dedicated copy engine)": "p2p",
-    "staged (GPU->host->GPU, P2P disabled)": "no_p2p",
+    "staged pipelined (GPU->host->GPU, P2P disabled)": "no_p2p",
+    "staged, no pipeline (GPU->host->GPU, P2P disabled)": "no_p2p_no_pipeline",
 }
 DEFAULT_TRACES = ["p2p"]  # raw Level-Zero P2P -- the real/best number; others are opt-in context
 # Okabe-Ito palette: distinguishable under deuteranopia/protanopia/tritanopia.
@@ -263,8 +264,11 @@ def main() -> None:
                "software artifact, kept as a before/after reference; "
                "'p2p_pull' = receiver pulls instead of sender pushing -- broken on this driver, always "
                "skips timing; "
-               "'no_p2p' = manual GPU->host->GPU baseline with P2P disabled (also via plain SYCL "
-               "queue.memcpy(), same mechanism as 'p2p_sycl', plus an extra host round-trip).")
+               "'no_p2p' = GPU->host->GPU baseline with P2P disabled, chunked and pipelined (raw "
+               "Level-Zero) so neighboring chunks' device<->host copies and MPI hop overlap -- the "
+               "best-effort 'P2P disabled' ceiling; "
+               "'no_p2p_no_pipeline' = same baseline but as one single full-buffer copy/send/copy with "
+               "no overlap -- naive worst-case reference.")
     left, right = st.columns(2)
     with left:
         st.plotly_chart(chart("P2P bandwidth", "bw_gbps", stat, "GB/s", False, selected_runs, bw_aggregated, selected_legs), use_container_width=True)
@@ -279,6 +283,7 @@ def main() -> None:
         p2p_sycl_bw = bw_aggregated[config].get("p2p_sycl", [])
         p2p_pull_bw = bw_aggregated[config].get("p2p_pull", [])
         no_p2p_bw = bw_aggregated[config].get("no_p2p", [])
+        no_p2p_no_pipeline_bw = bw_aggregated[config].get("no_p2p_no_pipeline", [])
         p2p_latency = latency_aggregated.get(config, {}).get("p2p", [])
         summary.append({
             "Configuration": config,
@@ -288,6 +293,7 @@ def main() -> None:
             "256 MB BW p2p_sycl (GB/s)": metric_at(p2p_sycl_bw, 256 * 1024 * 1024),
             "256 MB BW p2p_pull (GB/s)": metric_at(p2p_pull_bw, 256 * 1024 * 1024),
             "256 MB BW no_p2p (GB/s)": metric_at(no_p2p_bw, 256 * 1024 * 1024),
+            "256 MB BW no_p2p_no_pipeline (GB/s)": metric_at(no_p2p_no_pipeline_bw, 256 * 1024 * 1024),
         })
     st.subheader(f"{stat.title()} Summary")
     st.dataframe(summary, use_container_width=True, hide_index=True)
