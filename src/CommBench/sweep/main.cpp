@@ -171,7 +171,10 @@ int main(int argc, char *argv[]) {
   auto zeDevice = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(CommBench::q.get_device());
 
   // Dedicated-copy-engine immediate command list for the raw Level-Zero P2P leg (sender only).
+  // Also create a second list on the shared compute+copy group (ordinal 0) to test whether
+  // splitting a transfer across BOTH engines concurrently can exceed the single-engine ceiling.
   ze_command_list_handle_t copy_cl = nullptr;
+  ze_command_list_handle_t copy_cl_shared = nullptr;
   if (myid == sender) {
     bool dedicated = false;
     uint32_t ordinal = pick_copy_group_ordinal(zeDevice, dedicated);
@@ -180,7 +183,13 @@ int main(int argc, char *argv[]) {
     ze_command_queue_desc_t cq_desc = {ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC, nullptr, ordinal, 0, 0,
                                         ZE_COMMAND_QUEUE_MODE_DEFAULT, ZE_COMMAND_QUEUE_PRIORITY_NORMAL};
     zeCommandListCreateImmediate(zeContext, zeDevice, &cq_desc, &copy_cl);
+
+    uint32_t shared_ordinal = dedicated ? 0 : ordinal; // ordinal 0 is the shared compute+copy group
+    ze_command_queue_desc_t cq_desc_shared = {ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC, nullptr, shared_ordinal, 0, 0,
+                                               ZE_COMMAND_QUEUE_MODE_DEFAULT, ZE_COMMAND_QUEUE_PRIORITY_NORMAL};
+    zeCommandListCreateImmediate(zeContext, zeDevice, &cq_desc_shared, &copy_cl_shared);
   }
+
 
   if (myid == sender)
     dev_send = sycl::malloc_device<char>(MAX_BYTES, CommBench::q);
@@ -386,6 +395,68 @@ int main(int argc, char *argv[]) {
       }
     }
 
+    // ---------------- Leg 1d: P2P push split across two concurrent copy engines -------------
+    // Tests whether the ~42.5GB/s raw-L0 single-engine ceiling is a per-engine limit (in which
+    // case splitting the buffer across the dedicated copy engine AND the shared compute+copy
+    // engine concurrently should raise aggregate bandwidth) or a shared-resource limit further
+    // up the path (PCIe link/BAR aperture/IPC-import overhead), in which case it won't help.
+    // RESULT: it's WORSE, not better (~38GB/s vs ~42.5GB/s single-engine @256MB) -- confirms
+    // the ~42.5GB/s single dedicated-copy-engine number is a genuine shared-resource ceiling
+    // for this P2P-via-IPC path, not a per-engine artifact fixable by adding more engines.
+    {
+      bool ok = true;
+      if (myid == sender)
+        CommBench::q.memcpy(dev_send, host_pattern.data(), bytes).wait();
+      MPI_Barrier(MPI_COMM_WORLD);
+
+      size_t half = bytes / 2;
+      if (myid == sender) {
+        zeCommandListAppendMemoryCopy(copy_cl, remote_recv, dev_send, half, nullptr, 0, nullptr);
+        zeCommandListAppendMemoryCopy(copy_cl_shared, remote_recv + half, dev_send + half, bytes - half, nullptr, 0, nullptr);
+        zeCommandListHostSynchronize(copy_cl, UINT64_MAX);
+        zeCommandListHostSynchronize(copy_cl_shared, UINT64_MAX);
+      }
+      MPI_Barrier(MPI_COMM_WORLD);
+
+      if (myid == recver) {
+        CommBench::q.memcpy(host_result.data(), dev_recv, bytes).wait();
+        ok = (memcmp(host_result.data(), host_pattern.data(), bytes) == 0);
+      }
+      MPI_Bcast(&ok, 1, MPI_C_BOOL, recver, MPI_COMM_WORLD);
+
+      if (!ok) {
+        if (myid == printid)
+          printf("size %10zu bytes: P2P (dual engine) leg FAILED CORRECTNESS CHECK -- skipping timing\n", bytes);
+      } else {
+        std::vector<double> times(ITERS);
+        for (int iter = -WARMUP; iter < ITERS; iter++) {
+          MPI_Barrier(MPI_COMM_WORLD);
+          double t0 = MPI_Wtime();
+          if (myid == sender) {
+            zeCommandListAppendMemoryCopy(copy_cl, remote_recv, dev_send, half, nullptr, 0, nullptr);
+            zeCommandListAppendMemoryCopy(copy_cl_shared, remote_recv + half, dev_send + half, bytes - half, nullptr, 0, nullptr);
+            zeCommandListHostSynchronize(copy_cl, UINT64_MAX);
+            zeCommandListHostSynchronize(copy_cl_shared, UINT64_MAX);
+          }
+          double elapsed = MPI_Wtime() - t0;
+          MPI_Bcast(&elapsed, 1, MPI_DOUBLE, sender, MPI_COMM_WORLD);
+          if (iter >= 0)
+            times[iter] = elapsed;
+        }
+        if (myid == printid) {
+          double minT = *std::min_element(times.begin(), times.end());
+          double medT = median_of(times);
+          double avgT = 0;
+          for (double t : times) avgT += t;
+          avgT /= times.size();
+          printf("---- size %10zu bytes : P2P (raw Level-Zero, dual concurrent engines) ----\n", bytes);
+          printf("minTime: %.4e us, %.4e GB/s\n", minT * 1e6, bytes / minT / 1e9);
+          printf("medTime: %.4e us, %.4e GB/s\n", medT * 1e6, bytes / medT / 1e9);
+          printf("avgTime: %.4e us, %.4e GB/s\n\n", avgT * 1e6, bytes / avgT / 1e9);
+        }
+      }
+    }
+
     // ---------------- Leg 2: staged GPU0 -> host -> GPU1 ("P2P disabled" baseline) ----------
     {
       bool ok = true;
@@ -447,6 +518,7 @@ int main(int argc, char *argv[]) {
   if (myid == recver && dev_recv) sycl::free(dev_recv, CommBench::q);
   sycl::free(host_stage, CommBench::q);
   if (copy_cl) zeCommandListDestroy(copy_cl);
+  if (copy_cl_shared) zeCommandListDestroy(copy_cl_shared);
 
   MPI_Finalize();
   return 0;

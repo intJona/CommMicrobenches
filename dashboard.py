@@ -34,12 +34,13 @@ def resolve_results_root() -> Path:
 
 RESULTS_ROOT = resolve_results_root()
 RESULT_FILE_GLOB = "commbench_sweep_*.txt"
-SECTION_HEADER = re.compile(r"^---- size\s+(\d+) bytes : (P2P \(IPC, Level-Zero\)|P2P PULL \(IPC, Level-Zero\)|P2P \(raw Level-Zero, dedicated copy engine\)|staged \(GPU->host->GPU, P2P disabled\)) ----")
+SECTION_HEADER = re.compile(r"^---- size\s+(\d+) bytes : (P2P \(IPC, Level-Zero\)|P2P PULL \(IPC, Level-Zero\)|P2P \(raw Level-Zero, dedicated copy engine\)|P2P \(raw Level-Zero, dual concurrent engines\)|staged \(GPU->host->GPU, P2P disabled\)) ----")
 STAT_LINE = re.compile(r"^(minTime|medTime|avgTime):\s+([\d.eE+-]+) us,\s+([\d.eE+-]+) GB/s")
 LEG_LABEL = {
     "P2P (IPC, Level-Zero)": "p2p",
     "P2P PULL (IPC, Level-Zero)": "p2p_pull",
     "P2P (raw Level-Zero, dedicated copy engine)": "p2p_rawl0",
+    "P2P (raw Level-Zero, dual concurrent engines)": "p2p_dual",
     "staged (GPU->host->GPU, P2P disabled)": "staged",
 }
 # Okabe-Ito palette: distinguishable under deuteranopia/protanopia/tritanopia.

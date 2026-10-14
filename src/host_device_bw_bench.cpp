@@ -198,6 +198,18 @@ int main(int argc, char *argv[]) {
   auto zeContext = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_context());
   auto zeDevice = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_device());
 
+  printf("\n-- command queue groups --\n");
+  uint32_t group_count = 0;
+  zeDeviceGetCommandQueueGroupProperties(zeDevice, &group_count, nullptr);
+  std::vector<ze_command_queue_group_properties_t> group_props(group_count);
+  for (auto &p : group_props) p = {ZE_STRUCTURE_TYPE_COMMAND_QUEUE_GROUP_PROPERTIES, nullptr, 0, 0, 0};
+  zeDeviceGetCommandQueueGroupProperties(zeDevice, &group_count, group_props.data());
+  for (uint32_t i = 0; i < group_count; i++) {
+    printf("  ordinal %u: numQueues=%u, COMPUTE=%d, COPY=%d\n", i, group_props[i].numQueues,
+           (bool)(group_props[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COMPUTE),
+           (bool)(group_props[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COPY));
+  }
+
   printf("\n================ Raw Level-Zero: Host -> Device ================\n");
   sweep_raw_l0(zeContext, zeDevice, true);
   printf("\n================ Raw Level-Zero: Device -> Host ================\n");
