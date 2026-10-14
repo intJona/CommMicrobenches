@@ -1,0 +1,7 @@
+src/CommBench/sweep/*.o
+src/CommBench/sweep/sweep
+results/
+results.local_backup/
+.storage-config
+__pycache__/
+*.log

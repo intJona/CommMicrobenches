@@ -1,0 +1,7 @@
+# Machine-local override for where CommBench benchmark results are written/read.
+# Copy this file to .storage-config (gitignored) and uncomment/edit the path below.
+# If .storage-config doesn't exist, results/ (relative to the repo) is used.
+#
+# Absolute paths only. Precedence: $COMMBENCH_RESULTS_DIR env var > this file > ./results
+#
+# /mnt/example-share/proj/CCG/Shares/cr_arch_lab/Projects/PCIe CommBench Benchmarks/results
