@@ -246,7 +246,11 @@ def main() -> None:
                "'p2p' = sender pushes via SYCL queue.memcpy() (read local, write remote); "
                "'p2p_pull' = receiver pulls (read remote, write local); "
                "'p2p_rawl0' = same push direction as 'p2p' but issued via raw Level-Zero on the GPU's "
-               "dedicated copy engine, bypassing SYCL's abstraction tax; "
+               "dedicated copy engine, bypassing SYCL's abstraction tax -- this is the current best/real "
+               "P2P ceiling, use this one for cross-config comparisons; "
+               "'p2p_dual' = diagnostic-only leg that splits the transfer across BOTH the dedicated copy "
+               "engine and the shared compute+copy engine concurrently -- confirmed WORSE than 'p2p_rawl0' "
+               "(contention, not parallelism), kept only to document that result, not a result to chase; "
                "'staged' = manual GPU->host->GPU baseline (P2P disabled).")
     left, right = st.columns(2)
     with left:
@@ -261,6 +265,7 @@ def main() -> None:
         p2p_bw = bw_aggregated[config].get("p2p", [])
         p2p_pull_bw = bw_aggregated[config].get("p2p_pull", [])
         p2p_rawl0_bw = bw_aggregated[config].get("p2p_rawl0", [])
+        p2p_dual_bw = bw_aggregated[config].get("p2p_dual", [])
         staged_bw = bw_aggregated[config].get("staged", [])
         p2p_latency = latency_aggregated.get(config, {}).get("p2p", [])
         summary.append({
@@ -269,7 +274,8 @@ def main() -> None:
             "4 KB latency p2p (us)": metric_at(p2p_latency, 4096),
             "256 MB BW p2p push (GB/s)": metric_at(p2p_bw, 256 * 1024 * 1024),
             "256 MB BW p2p pull (GB/s)": metric_at(p2p_pull_bw, 256 * 1024 * 1024),
-            "256 MB BW p2p raw L0 (GB/s)": metric_at(p2p_rawl0_bw, 256 * 1024 * 1024),
+            "256 MB BW p2p raw L0 -- best (GB/s)": metric_at(p2p_rawl0_bw, 256 * 1024 * 1024),
+            "256 MB BW p2p dual-engine -- diagnostic, worse (GB/s)": metric_at(p2p_dual_bw, 256 * 1024 * 1024),
             "256 MB BW staged (GB/s)": metric_at(staged_bw, 256 * 1024 * 1024),
         })
     st.subheader(f"{stat.title()} Summary")
