@@ -45,7 +45,8 @@ Builds `src/CommBench/sweep/sweep` via `mpicxx` + `dpclang++` (oneAPI DPC++ SYCL
 ## Sweep
 
 ```bash
-./scripts/run_sweep.sh
+cd "/home/intel/PCIe CommBench Benchmarks"
+CONFIG_NAME="GNR_WS_Arc_P2P_Validation" RUNS=5 COMMBENCH_RESULTS_DIR="./results" ./scripts/run_sweep.sh
 ```
 
 Runs the sweep with `mpirun -np 2` (rank 0 = GPU0 sender, rank 1 = GPU1 receiver, pinned via
