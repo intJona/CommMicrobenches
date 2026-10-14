@@ -5,12 +5,15 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from collections import defaultdict
 from pathlib import Path
 from statistics import median
 
 import plotly.graph_objects as go
 import streamlit as st
+
+import cache_store
 
 REPO_ROOT = Path(__file__).resolve().parent
 
@@ -113,6 +116,29 @@ def discover_skipped_results() -> list[str]:
     return skipped
 
 
+FIRST_SCAN_NOTICE = ("No cached data found yet. The first scan has to walk the results directory over the network "
+    "share and can take a minute or more depending on how many runs are present.")
+REFRESH_NOTICE = "Rescanning RESULTS_ROOT over the network share -- this can take a minute or more."
+
+
+def get_runs(force_refresh: bool = False) -> tuple[list[dict], dict | None, bool]:
+    """Load runs from cache or re-scan. Returns (runs, meta, was_cached)."""
+    runs, meta = (None, None) if force_refresh else cache_store.load_runs(RESULTS_ROOT)
+    if runs is not None:
+        return runs, meta, True
+    banner = st.empty()
+    banner.warning(REFRESH_NOTICE if force_refresh else FIRST_SCAN_NOTICE)
+    t0 = time.time()
+    if force_refresh:
+        discover_runs.clear()  # bypass st.cache_data's own stale in-memory result too
+    with st.spinner("Scanning RESULTS_ROOT..."):
+        runs = discover_runs()
+    meta = cache_store.make_meta(t0)
+    cache_store.save_runs(RESULTS_ROOT, runs, meta)
+    banner.empty()
+    return runs, meta, False
+
+
 def aggregate_runs(runs: list[dict], metric: str, stat: str) -> dict[str, dict[str, list[dict]]]:
     """configs -> leg -> sorted [{size, value}] medians across runs, for a given stat (min/med/avg)."""
     grouped: dict[str, dict[str, dict[float, list[float]]]] = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
@@ -180,8 +206,18 @@ def metric_at(rows: list[dict], size: float) -> float | None:
 def main() -> None:
     st.set_page_config(page_title="CommBench PCIe P2P Results", page_icon="C", layout="wide")
     st.title("CommBench P2P (IPC) vs Staged (P2P-disabled) Results")
-    all_runs = discover_runs()
+
+    force_refresh = st.sidebar.button("Refresh data", help="Re-scan RESULTS_ROOT instead of using the cached scan")
+    all_runs, meta, was_cached = get_runs(force_refresh)
+
+    if meta:
+        age = f"{time.time() - meta['generated_at']:.0f}s ago" if was_cached else "just now"
+        st.sidebar.caption(f"Scan cached {age} (took {meta['duration_seconds']}s)")
+
     skipped_results = discover_skipped_results()
+    if force_refresh:
+        discover_skipped_results.clear()
+        skipped_results = discover_skipped_results()
     if not all_runs:
         st.info("No parseable CommBench result files found under results/.")
         return

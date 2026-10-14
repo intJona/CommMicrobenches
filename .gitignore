@@ -5,3 +5,6 @@ results.local_backup/
 .storage-config
 __pycache__/
 *.log
+# Disk-backed scan cache (cache_store.py) -- machine-local, regenerated on demand.
+.cache/
+
