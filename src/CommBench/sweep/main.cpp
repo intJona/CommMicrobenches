@@ -53,6 +53,31 @@ static double median_of(std::vector<double> &v) {
   return v[v.size() / 2];
 }
 
+// Picks a command-queue-group ordinal with COPY support, preferring a dedicated copy/blitter
+// engine (COPY but not COMPUTE) over the shared compute+copy group that SYCL's queue.memcpy()
+// implicitly uses. Root-caused via host_device_bw_bench: routing through the dedicated copy
+// engine via raw Level-Zero closes the ~32GB/s SYCL-abstraction ceiling up to ~55-57GB/s.
+static uint32_t pick_copy_group_ordinal(ze_device_handle_t dev, bool &is_dedicated) {
+  uint32_t count = 0;
+  zeDeviceGetCommandQueueGroupProperties(dev, &count, nullptr);
+  std::vector<ze_command_queue_group_properties_t> props(count);
+  for (auto &p : props) p = {ZE_STRUCTURE_TYPE_COMMAND_QUEUE_GROUP_PROPERTIES, nullptr, 0, 0, 0};
+  zeDeviceGetCommandQueueGroupProperties(dev, &count, props.data());
+
+  int fallback = -1;
+  for (uint32_t i = 0; i < count; i++) {
+    bool copy = props[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COPY;
+    bool compute = props[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COMPUTE;
+    if (copy && !compute) {
+      is_dedicated = true;
+      return i;
+    }
+    if (copy && fallback < 0) fallback = (int)i;
+  }
+  is_dedicated = false;
+  return fallback >= 0 ? (uint32_t)fallback : 0;
+}
+
 // Receiver side: accept one connection, hand over fd (SCM_RIGHTS) + the rest of the handle bytes.
 static void serve_ipc_handle(ze_ipc_mem_handle_t &handle) {
   int listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -144,6 +169,18 @@ int main(int argc, char *argv[]) {
 
   auto zeContext = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(CommBench::q.get_context());
   auto zeDevice = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(CommBench::q.get_device());
+
+  // Dedicated-copy-engine immediate command list for the raw Level-Zero P2P leg (sender only).
+  ze_command_list_handle_t copy_cl = nullptr;
+  if (myid == sender) {
+    bool dedicated = false;
+    uint32_t ordinal = pick_copy_group_ordinal(zeDevice, dedicated);
+    printf("rank %d: raw L0 P2P leg using command queue group ordinal %u (%s copy engine)\n",
+           myid, ordinal, dedicated ? "dedicated" : "shared compute+copy");
+    ze_command_queue_desc_t cq_desc = {ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC, nullptr, ordinal, 0, 0,
+                                        ZE_COMMAND_QUEUE_MODE_DEFAULT, ZE_COMMAND_QUEUE_PRIORITY_NORMAL};
+    zeCommandListCreateImmediate(zeContext, zeDevice, &cq_desc, &copy_cl);
+  }
 
   if (myid == sender)
     dev_send = sycl::malloc_device<char>(MAX_BYTES, CommBench::q);
@@ -295,6 +332,60 @@ int main(int argc, char *argv[]) {
       }
     }
 
+    // ---------------- Leg 1c: P2P push via raw Level-Zero on the dedicated copy engine --------
+    // Same transfer as Leg 1 (sender writes dev_send -> remote_recv), but issued through
+    // zeCommandListAppendMemoryCopy on a dedicated-copy-engine immediate command list instead
+    // of SYCL's queue.memcpy(), to bypass the SYCL-runtime abstraction tax confirmed in
+    // host_device_bw_bench (SYCL plateaus ~32GB/s, raw L0 dedicated copy engine reaches ~55-57GB/s).
+    {
+      bool ok = true;
+      if (myid == sender)
+        CommBench::q.memcpy(dev_send, host_pattern.data(), bytes).wait();
+      MPI_Barrier(MPI_COMM_WORLD);
+
+      if (myid == sender) {
+        zeCommandListAppendMemoryCopy(copy_cl, remote_recv, dev_send, bytes, nullptr, 0, nullptr);
+        zeCommandListHostSynchronize(copy_cl, UINT64_MAX);
+      }
+      MPI_Barrier(MPI_COMM_WORLD);
+
+      if (myid == recver) {
+        CommBench::q.memcpy(host_result.data(), dev_recv, bytes).wait();
+        ok = (memcmp(host_result.data(), host_pattern.data(), bytes) == 0);
+      }
+      MPI_Bcast(&ok, 1, MPI_C_BOOL, recver, MPI_COMM_WORLD);
+
+      if (!ok) {
+        if (myid == printid)
+          printf("size %10zu bytes: P2P (raw L0) leg FAILED CORRECTNESS CHECK -- skipping timing\n", bytes);
+      } else {
+        std::vector<double> times(ITERS);
+        for (int iter = -WARMUP; iter < ITERS; iter++) {
+          MPI_Barrier(MPI_COMM_WORLD);
+          double t0 = MPI_Wtime();
+          if (myid == sender) {
+            zeCommandListAppendMemoryCopy(copy_cl, remote_recv, dev_send, bytes, nullptr, 0, nullptr);
+            zeCommandListHostSynchronize(copy_cl, UINT64_MAX);
+          }
+          double elapsed = MPI_Wtime() - t0;
+          MPI_Bcast(&elapsed, 1, MPI_DOUBLE, sender, MPI_COMM_WORLD);
+          if (iter >= 0)
+            times[iter] = elapsed;
+        }
+        if (myid == printid) {
+          double minT = *std::min_element(times.begin(), times.end());
+          double medT = median_of(times);
+          double avgT = 0;
+          for (double t : times) avgT += t;
+          avgT /= times.size();
+          printf("---- size %10zu bytes : P2P (raw Level-Zero, dedicated copy engine) ----\n", bytes);
+          printf("minTime: %.4e us, %.4e GB/s\n", minT * 1e6, bytes / minT / 1e9);
+          printf("medTime: %.4e us, %.4e GB/s\n", medT * 1e6, bytes / medT / 1e9);
+          printf("avgTime: %.4e us, %.4e GB/s\n\n", avgT * 1e6, bytes / avgT / 1e9);
+        }
+      }
+    }
+
     // ---------------- Leg 2: staged GPU0 -> host -> GPU1 ("P2P disabled" baseline) ----------
     {
       bool ok = true;
@@ -355,6 +446,7 @@ int main(int argc, char *argv[]) {
   if (myid == sender && dev_send) sycl::free(dev_send, CommBench::q);
   if (myid == recver && dev_recv) sycl::free(dev_recv, CommBench::q);
   sycl::free(host_stage, CommBench::q);
+  if (copy_cl) zeCommandListDestroy(copy_cl);
 
   MPI_Finalize();
   return 0;
