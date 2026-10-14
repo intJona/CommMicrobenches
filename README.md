@@ -74,3 +74,4 @@ streamlit run dashboard.py
 Compares bandwidth/latency across saved runs/configurations, with a toggle for which
 statistic (min/median/avg across iterations) to plot, and separate series for the `p2p`
 (genuine Level-Zero IPC) and `staged` (P2P-disabled baseline) legs.
+# CommMicrobenches
