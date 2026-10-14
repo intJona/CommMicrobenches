@@ -34,11 +34,12 @@ def resolve_results_root() -> Path:
 
 RESULTS_ROOT = resolve_results_root()
 RESULT_FILE_GLOB = "commbench_sweep_*.txt"
-SECTION_HEADER = re.compile(r"^---- size\s+(\d+) bytes : (P2P \(IPC, Level-Zero\)|P2P PULL \(IPC, Level-Zero\)|staged \(GPU->host->GPU, P2P disabled\)) ----")
+SECTION_HEADER = re.compile(r"^---- size\s+(\d+) bytes : (P2P \(IPC, Level-Zero\)|P2P PULL \(IPC, Level-Zero\)|P2P \(raw Level-Zero, dedicated copy engine\)|staged \(GPU->host->GPU, P2P disabled\)) ----")
 STAT_LINE = re.compile(r"^(minTime|medTime|avgTime):\s+([\d.eE+-]+) us,\s+([\d.eE+-]+) GB/s")
 LEG_LABEL = {
     "P2P (IPC, Level-Zero)": "p2p",
     "P2P PULL (IPC, Level-Zero)": "p2p_pull",
+    "P2P (raw Level-Zero, dedicated copy engine)": "p2p_rawl0",
     "staged (GPU->host->GPU, P2P disabled)": "staged",
 }
 # Okabe-Ito palette: distinguishable under deuteranopia/protanopia/tritanopia.
@@ -241,7 +242,10 @@ def main() -> None:
     latency_aggregated = aggregate_runs(selected_runs, "latency_us", stat)
     st.caption(f"{len(selected_runs)} run(s) across {len(configs)} configuration(s), stat={stat}. "
                "Thin lines are individual runs; solid lines are per-size medians across runs. "
-               "'p2p' = sender pushes (read local, write remote); 'p2p_pull' = receiver pulls (read remote, write local); "
+               "'p2p' = sender pushes via SYCL queue.memcpy() (read local, write remote); "
+               "'p2p_pull' = receiver pulls (read remote, write local); "
+               "'p2p_rawl0' = same push direction as 'p2p' but issued via raw Level-Zero on the GPU's "
+               "dedicated copy engine, bypassing SYCL's abstraction tax; "
                "'staged' = manual GPU->host->GPU baseline (P2P disabled).")
     left, right = st.columns(2)
     with left:
@@ -255,6 +259,7 @@ def main() -> None:
         environment = matching_runs[0]["environment"]
         p2p_bw = bw_aggregated[config].get("p2p", [])
         p2p_pull_bw = bw_aggregated[config].get("p2p_pull", [])
+        p2p_rawl0_bw = bw_aggregated[config].get("p2p_rawl0", [])
         staged_bw = bw_aggregated[config].get("staged", [])
         p2p_latency = latency_aggregated.get(config, {}).get("p2p", [])
         summary.append({
@@ -263,6 +268,7 @@ def main() -> None:
             "4 KB latency p2p (us)": metric_at(p2p_latency, 4096),
             "256 MB BW p2p push (GB/s)": metric_at(p2p_bw, 256 * 1024 * 1024),
             "256 MB BW p2p pull (GB/s)": metric_at(p2p_pull_bw, 256 * 1024 * 1024),
+            "256 MB BW p2p raw L0 (GB/s)": metric_at(p2p_rawl0_bw, 256 * 1024 * 1024),
             "256 MB BW staged (GB/s)": metric_at(staged_bw, 256 * 1024 * 1024),
         })
     st.subheader(f"{stat.title()} Summary")
