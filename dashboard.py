@@ -189,6 +189,8 @@ def chart(title: str, metric: str, stat: str, unit: str, y_log: bool, runs: list
             ))
     for config, by_leg in aggregated.items():
         for leg, rows in by_leg.items():
+            if leg not in traces:
+                continue
             key = f"{config} ({leg})"
             style = styles[key]
             figure.add_trace(go.Scatter(
