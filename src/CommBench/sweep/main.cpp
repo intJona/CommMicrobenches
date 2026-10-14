@@ -170,12 +170,14 @@ int main(int argc, char *argv[]) {
   auto zeContext = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(CommBench::q.get_context());
   auto zeDevice = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(CommBench::q.get_device());
 
-  // Dedicated-copy-engine immediate command list for the raw Level-Zero P2P leg (sender only).
+  // Dedicated-copy-engine immediate command list for raw Level-Zero copies (both ranks use their
+  // own local device's engine: sender for the P2P push leg, both ranks for the no-P2P staged leg's
+  // host<->device copies, so it's a fair apples-to-apples comparison against the 'p2p' leg above).
   ze_command_list_handle_t copy_cl = nullptr;
-  if (myid == sender) {
+  {
     bool dedicated = false;
     uint32_t ordinal = pick_copy_group_ordinal(zeDevice, dedicated);
-    printf("rank %d: raw L0 P2P leg using command queue group ordinal %u (%s copy engine)\n",
+    printf("rank %d: raw L0 using command queue group ordinal %u (%s copy engine)\n",
            myid, ordinal, dedicated ? "dedicated" : "shared compute+copy");
     ze_command_queue_desc_t cq_desc = {ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC, nullptr, ordinal, 0, 0,
                                         ZE_COMMAND_QUEUE_MODE_DEFAULT, ZE_COMMAND_QUEUE_PRIORITY_NORMAL};
@@ -387,7 +389,11 @@ int main(int argc, char *argv[]) {
       }
     }
 
-    // ---------------- Leg 2: staged GPU0 -> host -> GPU1 ("P2P disabled" baseline) ----------
+    // ---------------- Leg 2: staged GPU0 -> host -> GPU1 ("P2P disabled" baseline), raw L0 ------
+    // Same host-staged mechanism as before, but the host<->device copies now go through raw
+    // Level-Zero on each rank's own dedicated copy engine instead of SYCL queue.memcpy() -- an
+    // apples-to-apples comparison against the 'p2p' leg above (both bypass the SYCL abstraction
+    // tax; the only remaining variable is P2P-over-PCIe vs round-tripping through host RAM).
     {
       bool ok = true;
       if (myid == sender)
@@ -395,11 +401,13 @@ int main(int argc, char *argv[]) {
 
       // Untimed correctness pass.
       if (myid == sender) {
-        CommBench::q.memcpy(host_stage, dev_send, bytes).wait();
+        zeCommandListAppendMemoryCopy(copy_cl, host_stage, dev_send, bytes, nullptr, 0, nullptr);
+        zeCommandListHostSynchronize(copy_cl, UINT64_MAX);
         MPI_Send(host_stage, bytes, MPI_BYTE, recver, 0, MPI_COMM_WORLD);
       } else {
         MPI_Recv(host_stage, bytes, MPI_BYTE, sender, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        CommBench::q.memcpy(dev_recv, host_stage, bytes).wait();
+        zeCommandListAppendMemoryCopy(copy_cl, dev_recv, host_stage, bytes, nullptr, 0, nullptr);
+        zeCommandListHostSynchronize(copy_cl, UINT64_MAX);
         CommBench::q.memcpy(host_result.data(), dev_recv, bytes).wait();
         ok = (memcmp(host_result.data(), host_pattern.data(), bytes) == 0);
       }
@@ -414,13 +422,15 @@ int main(int argc, char *argv[]) {
           MPI_Barrier(MPI_COMM_WORLD);
           double t0 = MPI_Wtime();
           if (myid == sender) {
-            CommBench::q.memcpy(host_stage, dev_send, bytes).wait();
+            zeCommandListAppendMemoryCopy(copy_cl, host_stage, dev_send, bytes, nullptr, 0, nullptr);
+            zeCommandListHostSynchronize(copy_cl, UINT64_MAX);
             MPI_Send(host_stage, bytes, MPI_BYTE, recver, 1, MPI_COMM_WORLD);
             int ack;
             MPI_Recv(&ack, 1, MPI_INT, recver, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
           } else {
             MPI_Recv(host_stage, bytes, MPI_BYTE, sender, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            CommBench::q.memcpy(dev_recv, host_stage, bytes).wait();
+            zeCommandListAppendMemoryCopy(copy_cl, dev_recv, host_stage, bytes, nullptr, 0, nullptr);
+            zeCommandListHostSynchronize(copy_cl, UINT64_MAX);
             int ack = 1;
             MPI_Send(&ack, 1, MPI_INT, sender, 2, MPI_COMM_WORLD);
           }

@@ -37,12 +37,12 @@ RESULT_FILE_GLOB = "commbench_sweep_*.txt"
 SECTION_HEADER = re.compile(r"^---- size\s+(\d+) bytes : (P2P \(IPC, Level-Zero\)|P2P PULL \(IPC, Level-Zero\)|P2P \(raw Level-Zero, dedicated copy engine\)|staged \(GPU->host->GPU, P2P disabled\)) ----")
 STAT_LINE = re.compile(r"^(minTime|medTime|avgTime):\s+([\d.eE+-]+) us,\s+([\d.eE+-]+) GB/s")
 LEG_LABEL = {
-    "P2P (IPC, Level-Zero)": "p2p",
+    "P2P (IPC, Level-Zero)": "p2p_sycl",
     "P2P PULL (IPC, Level-Zero)": "p2p_pull",
-    "P2P (raw Level-Zero, dedicated copy engine)": "p2p_rawl0",
-    "staged (GPU->host->GPU, P2P disabled)": "staged",
+    "P2P (raw Level-Zero, dedicated copy engine)": "p2p",
+    "staged (GPU->host->GPU, P2P disabled)": "no_p2p",
 }
-DEFAULT_LEGS = ["p2p_rawl0"]  # the real/best P2P number; others are opt-in context
+DEFAULT_TRACES = ["p2p"]  # raw Level-Zero P2P -- the real/best number; others are opt-in context
 # Okabe-Ito palette: distinguishable under deuteranopia/protanopia/tritanopia.
 PALETTE = ["#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7", "#000000"]
 DASH_STYLES = ["solid", "dash", "dot", "dashdot", "longdash", "longdashdot"]
@@ -162,7 +162,7 @@ def aggregate_runs(runs: list[dict], metric: str, stat: str) -> dict[str, dict[s
     }
 
 
-def chart(title: str, metric: str, stat: str, unit: str, y_log: bool, runs: list[dict], aggregated: dict[str, dict[str, list[dict]]], legs: set[str]) -> go.Figure:
+def chart(title: str, metric: str, stat: str, unit: str, y_log: bool, runs: list[dict], aggregated: dict[str, dict[str, list[dict]]], traces: set[str]) -> go.Figure:
     figure = go.Figure()
     series_keys = sorted({f"{config} ({leg})" for config in aggregated for leg in aggregated[config]})
     styles = {
@@ -176,7 +176,7 @@ def chart(title: str, metric: str, stat: str, unit: str, y_log: bool, runs: list
     for run in runs:
         by_leg: dict[str, list[dict]] = defaultdict(list)
         for row in run["rows"]:
-            if row["stat"] == stat and row["leg"] in legs:
+            if row["stat"] == stat and row["leg"] in traces:
                 by_leg[row["leg"]].append({"size": row["size"], "value": row[metric]})
         for leg, rows in by_leg.items():
             rows = sorted(rows, key=lambda r: r["size"])
@@ -240,25 +240,29 @@ def main() -> None:
         return
 
     available_legs = sorted({row["leg"] for run in selected_runs for row in run["rows"]})
-    default_legs = [leg for leg in DEFAULT_LEGS if leg in available_legs] or available_legs
-    selected_legs = set(st.sidebar.multiselect("Legs", available_legs, default=default_legs,
-                                                help="p2p_rawl0 is the real/best P2P number; the rest are optional context"))
+    default_legs = [leg for leg in DEFAULT_TRACES if leg in available_legs] or available_legs
+    # Key includes the option set so a changed/renamed trace list resets the widget to the
+    # new default instead of silently carrying over a stale selection from an older session.
+    traces_key = "traces_" + ",".join(available_legs)
+    selected_legs = set(st.sidebar.multiselect("Traces", available_legs, default=default_legs, key=traces_key,
+                                                help="p2p is the real/best P2P number; the rest are optional context"))
     if not selected_legs:
-        st.warning("Select at least one leg.")
+        st.warning("Select at least one trace.")
         return
 
     bw_aggregated = aggregate_runs(selected_runs, "bw_gbps", stat)
     latency_aggregated = aggregate_runs(selected_runs, "latency_us", stat)
     st.caption(f"{len(selected_runs)} run(s) across {len(configs)} configuration(s), stat={stat}. "
                "Thin lines are individual runs; solid lines are per-size medians across runs. "
-               "'p2p_rawl0' = genuine GPU<->GPU P2P (IPC), issued via raw Level-Zero on the GPU's "
+               "'p2p' = genuine GPU<->GPU P2P (IPC), issued via raw Level-Zero on the GPU's "
                "dedicated copy engine, bypassing SYCL's abstraction tax -- this is the real/best P2P "
                "number, shown by default; "
-               "'p2p' = same P2P transfer via plain SYCL queue.memcpy() -- capped lower by a software "
-               "artifact, kept as a before/after reference; "
+               "'p2p_sycl' = same P2P transfer via plain SYCL queue.memcpy() -- capped lower by a "
+               "software artifact, kept as a before/after reference; "
                "'p2p_pull' = receiver pulls instead of sender pushing -- broken on this driver, always "
                "skips timing; "
-               "'staged' = manual GPU->host->GPU baseline (P2P disabled).")
+               "'no_p2p' = manual GPU->host->GPU baseline with P2P disabled (also via plain SYCL "
+               "queue.memcpy(), same mechanism as 'p2p_sycl', plus an extra host round-trip).")
     left, right = st.columns(2)
     with left:
         st.plotly_chart(chart("P2P bandwidth", "bw_gbps", stat, "GB/s", False, selected_runs, bw_aggregated, selected_legs), use_container_width=True)
@@ -269,19 +273,19 @@ def main() -> None:
     for config in sorted(bw_aggregated):
         matching_runs = [run for run in selected_runs if run["config"] == config]
         environment = matching_runs[0]["environment"]
-        p2p_rawl0_bw = bw_aggregated[config].get("p2p_rawl0", [])
         p2p_bw = bw_aggregated[config].get("p2p", [])
+        p2p_sycl_bw = bw_aggregated[config].get("p2p_sycl", [])
         p2p_pull_bw = bw_aggregated[config].get("p2p_pull", [])
-        staged_bw = bw_aggregated[config].get("staged", [])
-        p2p_latency = latency_aggregated.get(config, {}).get("p2p_rawl0", [])
+        no_p2p_bw = bw_aggregated[config].get("no_p2p", [])
+        p2p_latency = latency_aggregated.get(config, {}).get("p2p", [])
         summary.append({
             "Configuration": config,
             "Runs": len(matching_runs),
-            "4 KB latency p2p raw L0 (us)": metric_at(p2p_latency, 4096),
-            "256 MB BW p2p raw L0 -- best (GB/s)": metric_at(p2p_rawl0_bw, 256 * 1024 * 1024),
-            "256 MB BW p2p push (GB/s)": metric_at(p2p_bw, 256 * 1024 * 1024),
-            "256 MB BW p2p pull (GB/s)": metric_at(p2p_pull_bw, 256 * 1024 * 1024),
-            "256 MB BW staged (GB/s)": metric_at(staged_bw, 256 * 1024 * 1024),
+            "4 KB latency p2p (us)": metric_at(p2p_latency, 4096),
+            "256 MB BW p2p -- best (GB/s)": metric_at(p2p_bw, 256 * 1024 * 1024),
+            "256 MB BW p2p_sycl (GB/s)": metric_at(p2p_sycl_bw, 256 * 1024 * 1024),
+            "256 MB BW p2p_pull (GB/s)": metric_at(p2p_pull_bw, 256 * 1024 * 1024),
+            "256 MB BW no_p2p (GB/s)": metric_at(no_p2p_bw, 256 * 1024 * 1024),
         })
     st.subheader(f"{stat.title()} Summary")
     st.dataframe(summary, use_container_width=True, hide_index=True)
