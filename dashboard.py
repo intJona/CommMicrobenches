@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Interactive comparison dashboard for saved CommBench P2P-vs-staged sweep runs."""
+"""Interactive dashboard for saved CommBench GPU-to-GPU P2P sweep runs."""
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import time
@@ -34,20 +35,27 @@ def resolve_results_root() -> Path:
 
 RESULTS_ROOT = resolve_results_root()
 RESULT_FILE_GLOB = "commbench_sweep_*.txt"
-SECTION_HEADER = re.compile(r"^---- size\s+(\d+) bytes : (P2P \(IPC, Level-Zero\)|P2P PULL \(IPC, Level-Zero\)|P2P \(raw Level-Zero, dedicated copy engine\)|staged, no pipeline \(GPU->host->GPU, P2P disabled\)|staged pipelined \(GPU->host->GPU, P2P disabled\)) ----")
 STAT_LINE = re.compile(r"^(minTime|medTime|avgTime):\s+([\d.eE+-]+) us,\s+([\d.eE+-]+) GB/s")
 LEG_LABEL = {
     "P2P (IPC, Level-Zero)": "p2p_sycl",
     "P2P PULL (IPC, Level-Zero)": "p2p_pull",
     "P2P (raw Level-Zero, dedicated copy engine)": "p2p",
-    "staged pipelined (GPU->host->GPU, P2P disabled)": "no_p2p",
-    "staged, no pipeline (GPU->host->GPU, P2P disabled)": "no_p2p_no_pipeline",
+    "staged pipelined (GPU->host->GPU, P2P disabled)": "staged",
+    # Naive non-pipelined baseline: recognized so its rows aren't misattributed to the
+    # preceding section, but dropped -- real GPU-to-GPU comms (e.g. LLM traffic) are pipelined.
+    "staged, no pipeline (GPU->host->GPU, P2P disabled)": None,
 }
+# Built from LEG_LABEL's keys to keep this line short.
+SECTION_HEADER = re.compile(r"^---- size\s+(\d+) bytes : (" + "|".join(re.escape(k) for k in LEG_LABEL) + r") ----")
 DEFAULT_TRACES = ["p2p"]  # raw Level-Zero P2P -- the real/best number; others are opt-in context
+# Fixed leg order -- colors are assigned from this list so a leg keeps its color no matter
+# which configs/traces are currently selected in the sidebar.
+ALL_LEGS = ["p2p", "p2p_sycl", "p2p_pull", "staged"]
 # Okabe-Ito palette: distinguishable under deuteranopia/protanopia/tritanopia.
 PALETTE = ["#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7", "#000000"]
 DASH_STYLES = ["solid", "dash", "dot", "dashdot", "longdash", "longdashdot"]
 MARKER_SYMBOLS = ["circle", "square", "diamond", "triangle-up", "x", "star", "triangle-down", "pentagon"]
+LEG_STYLE_INDEX = {leg: index for index, leg in enumerate(ALL_LEGS)}
 
 
 def read_environment(path: Path) -> dict[str, str]:
@@ -78,7 +86,7 @@ def parse_result(path: Path) -> list[dict]:
             leg = LEG_LABEL[header_match.group(2)]
             continue
         stat_match = STAT_LINE.match(line)
-        if stat_match and size is not None:
+        if stat_match and size is not None and leg is not None:
             stat, time_us, gbps = stat_match.groups()
             rows.append({
                 "size": size,
@@ -163,17 +171,22 @@ def aggregate_runs(runs: list[dict], metric: str, stat: str) -> dict[str, dict[s
     }
 
 
-def chart(title: str, metric: str, stat: str, unit: str, y_log: bool, runs: list[dict], aggregated: dict[str, dict[str, list[dict]]], traces: set[str]) -> go.Figure:
+def chart(title: str, metric: str, stat: str, unit: str, y_log: bool, runs: list[dict], aggregated: dict[str, dict[str, list[dict]]], traces: set[str], all_configs: list[str]) -> go.Figure:
     figure = go.Figure()
-    series_keys = sorted({f"{config} ({leg})" for config in aggregated for leg in aggregated[config]})
-    styles = {
-        key: {
+    # Color comes from the leg (fixed, see LEG_COLOR); dash/symbol come from the config's position in
+    # the full known config list -- both are independent of whatever is currently selected in the
+    # sidebar, so a trace never changes color/style just because some other trace was toggled off.
+    config_index = {config: index for index, config in enumerate(all_configs)}
+
+    def style_for(config: str, leg: str) -> dict:
+        index = config_index.get(config, 0)
+        leg_index = LEG_STYLE_INDEX.get(leg, 0)
+        return {
             "color": PALETTE[index % len(PALETTE)],
-            "dash": DASH_STYLES[index % len(DASH_STYLES)],
-            "symbol": MARKER_SYMBOLS[index % len(MARKER_SYMBOLS)],
+            "dash": DASH_STYLES[leg_index % len(DASH_STYLES)],
+            "symbol": MARKER_SYMBOLS[leg_index % len(MARKER_SYMBOLS)],
         }
-        for index, key in enumerate(series_keys)
-    }
+
     for run in runs:
         by_leg: dict[str, list[dict]] = defaultdict(list)
         for row in run["rows"]:
@@ -181,7 +194,7 @@ def chart(title: str, metric: str, stat: str, unit: str, y_log: bool, runs: list
                 by_leg[row["leg"]].append({"size": row["size"], "value": row[metric]})
         for leg, rows in by_leg.items():
             rows = sorted(rows, key=lambda r: r["size"])
-            style = styles[f"{run['config']} ({leg})"]
+            style = style_for(run["config"], leg)
             figure.add_trace(go.Scatter(
                 x=[row["size"] for row in rows], y=[row["value"] for row in rows],
                 mode="lines", line={"color": style["color"], "width": 1, "dash": "dot"}, opacity=0.28,
@@ -193,7 +206,7 @@ def chart(title: str, metric: str, stat: str, unit: str, y_log: bool, runs: list
             if leg not in traces:
                 continue
             key = f"{config} ({leg})"
-            style = styles[key]
+            style = style_for(config, leg)
             figure.add_trace(go.Scatter(
                 x=[row["size"] for row in rows], y=[row["value"] for row in rows], mode="lines+markers",
                 name=f"{key} median",
@@ -212,9 +225,50 @@ def metric_at(rows: list[dict], size: float) -> float | None:
     return next((row["value"] for row in rows if row["size"] == size), None)
 
 
+def decade_sizes(sizes) -> list[float]:
+    """Smallest size recorded in each log10 decade, plus the overall max -- regular sample points for a
+    log-scale sweep. The max is forced in because it can share a decade with (and get shadowed by) a
+    smaller size, e.g. 256 MB and 128 MB both fall in the 10^8-10^9 decade."""
+    sizes = [size for size in sizes if size > 0]
+    if not sizes:
+        return []
+    buckets: dict[int, float] = {}
+    for size in sizes:
+        decade = math.floor(math.log10(size))
+        if decade not in buckets or size < buckets[decade]:
+            buckets[decade] = size
+    return sorted(set(buckets.values()) | {max(sizes)})
+
+
+def format_size(size: float) -> str:
+    if size >= 1024 * 1024 and size % (1024 * 1024) == 0:
+        return f"{int(size // (1024 * 1024))} MB"
+    if size >= 1024 and size % 1024 == 0:
+        return f"{int(size // 1024)} KB"
+    return f"{int(size)} B"
+
+
+def decade_table(runs: list[dict], aggregated: dict[str, dict[str, list[dict]]], traces: set[str]) -> list[dict]:
+    """One row per (config, leg) with the metric value at the start of each log-scale decade."""
+    all_sizes = {row["size"] for by_leg in aggregated.values() for rows in by_leg.values() for row in rows}
+    decades = decade_sizes(all_sizes)
+    table = []
+    for config in sorted(aggregated):
+        matching_runs = [run for run in runs if run["config"] == config]
+        for leg, rows in aggregated[config].items():
+            if leg not in traces:
+                continue
+            value_by_size = {row["size"]: row["value"] for row in rows}
+            entry = {"Configuration": config, "Trace": leg, "Runs": len(matching_runs)}
+            for size in decades:
+                entry[format_size(size)] = value_by_size.get(size)
+            table.append(entry)
+    return table
+
+
 def main() -> None:
-    st.set_page_config(page_title="CommBench PCIe P2P Results", page_icon="C", layout="wide")
-    st.title("CommBench P2P (IPC) vs Staged (P2P-disabled) Results")
+    st.set_page_config(page_title="CommBench P2P Results", page_icon="C", layout="wide")
+    st.title("CommBench: GPU-to-GPU P2P Bandwidth & Latency")
 
     force_refresh = st.sidebar.button("Refresh data", help="Re-scan RESULTS_ROOT instead of using the cached scan")
     all_runs, meta, was_cached = get_runs(force_refresh)
@@ -264,16 +318,20 @@ def main() -> None:
                "software artifact, kept as a before/after reference; "
                "'p2p_pull' = receiver pulls instead of sender pushing -- broken on this driver, always "
                "skips timing; "
-               "'no_p2p' = GPU->host->GPU baseline with P2P disabled, chunked and pipelined (raw "
+               "'staged' = GPU->host->GPU baseline with P2P disabled, chunked and pipelined (raw "
                "Level-Zero) so neighboring chunks' device<->host copies and MPI hop overlap -- the "
-               "best-effort 'P2P disabled' ceiling; "
-               "'no_p2p_no_pipeline' = same baseline but as one single full-buffer copy/send/copy with "
-               "no overlap -- naive worst-case reference.")
+               "best-effort 'P2P disabled' ceiling, representative of real (pipelined) comms.")
     left, right = st.columns(2)
     with left:
-        st.plotly_chart(chart("P2P bandwidth", "bw_gbps", stat, "GB/s", False, selected_runs, bw_aggregated, selected_legs), use_container_width=True)
+        st.plotly_chart(chart("P2P bandwidth", "bw_gbps", stat, "GB/s", False, selected_runs, bw_aggregated, selected_legs, configs), use_container_width=True)
     with right:
-        st.plotly_chart(chart("P2P latency", "latency_us", stat, "us", True, selected_runs, latency_aggregated, selected_legs), use_container_width=True)
+        st.plotly_chart(chart("P2P latency", "latency_us", stat, "us", True, selected_runs, latency_aggregated, selected_legs, configs), use_container_width=True)
+
+    st.subheader("Bandwidth by decade (GB/s)")
+    st.dataframe(decade_table(selected_runs, bw_aggregated, selected_legs), use_container_width=True, hide_index=True)
+
+    st.subheader("Latency by decade (us)")
+    st.dataframe(decade_table(selected_runs, latency_aggregated, selected_legs), use_container_width=True, hide_index=True)
 
     summary = []
     for config in sorted(bw_aggregated):
@@ -282,8 +340,7 @@ def main() -> None:
         p2p_bw = bw_aggregated[config].get("p2p", [])
         p2p_sycl_bw = bw_aggregated[config].get("p2p_sycl", [])
         p2p_pull_bw = bw_aggregated[config].get("p2p_pull", [])
-        no_p2p_bw = bw_aggregated[config].get("no_p2p", [])
-        no_p2p_no_pipeline_bw = bw_aggregated[config].get("no_p2p_no_pipeline", [])
+        staged_bw = bw_aggregated[config].get("staged", [])
         p2p_latency = latency_aggregated.get(config, {}).get("p2p", [])
         summary.append({
             "Configuration": config,
@@ -292,8 +349,7 @@ def main() -> None:
             "256 MB BW p2p -- best (GB/s)": metric_at(p2p_bw, 256 * 1024 * 1024),
             "256 MB BW p2p_sycl (GB/s)": metric_at(p2p_sycl_bw, 256 * 1024 * 1024),
             "256 MB BW p2p_pull (GB/s)": metric_at(p2p_pull_bw, 256 * 1024 * 1024),
-            "256 MB BW no_p2p (GB/s)": metric_at(no_p2p_bw, 256 * 1024 * 1024),
-            "256 MB BW no_p2p_no_pipeline (GB/s)": metric_at(no_p2p_no_pipeline_bw, 256 * 1024 * 1024),
+            "256 MB BW staged (GB/s)": metric_at(staged_bw, 256 * 1024 * 1024),
         })
     st.subheader(f"{stat.title()} Summary")
     st.dataframe(summary, use_container_width=True, hide_index=True)
